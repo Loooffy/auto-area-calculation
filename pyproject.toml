@@ -1,0 +1,19 @@
+[project]
+name = "area-template-builder"
+version = "0.1.0"
+description = "建立面積持分試算表（保留標題、合併儲存格與算式）。"
+requires-python = ">=3.11"
+dependencies = [
+    "openpyxl>=3.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
