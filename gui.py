@@ -5,6 +5,7 @@ import traceback
 from pathlib import Path
 from tkinter import (
     BOTH,
+    BooleanVar,
     DISABLED,
     NORMAL,
     RIGHT,
@@ -41,6 +42,7 @@ class TemplateBuilderApp:
         self.csv_path = StringVar()
         self.public_ratio = StringVar()
         self.output_path = StringVar()
+        self.include_porch = BooleanVar(value=False)
 
         # 每種車位的 寬 / 長 / 數量 輸入欄
         self.parking_rows: list[dict[str, object]] = []
@@ -89,12 +91,15 @@ class TemplateBuilderApp:
             row=2, column=2, sticky=W, **padding
         )
 
+        # 門廊（可選）
+        self._build_porch_section(frame, row=3, padding=padding)
+
         # 車位設定
-        self._build_parking_section(frame, row=3, padding=padding)
+        self._build_parking_section(frame, row=4, padding=padding)
 
         # 動作按鈕
         button_bar = ttk.Frame(frame)
-        button_bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 6))
+        button_bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 6))
         self.build_button = ttk.Button(
             button_bar, text="建立試算表", command=self._on_build_clicked
         )
@@ -107,7 +112,33 @@ class TemplateBuilderApp:
         self.status = StringVar(value="請選擇 CSV 檔案並輸入公設比。")
         ttk.Label(
             frame, textvariable=self.status, foreground="#444", wraplength=520
-        ).grid(row=5, column=0, columnspan=3, sticky=W, **padding)
+        ).grid(row=6, column=0, columnspan=3, sticky=W, **padding)
+
+    def _build_porch_section(
+        self, parent: ttk.Frame, row: int, padding: dict[str, int]
+    ) -> None:
+        section = ttk.LabelFrame(parent, text="門廊", padding=10)
+        section.grid(row=row, column=0, columnspan=3, sticky="ew", **padding)
+        section.columnconfigure(0, weight=1)
+
+        ttk.Checkbutton(
+            section,
+            text="這個案子有門廊",
+            variable=self.include_porch,
+        ).grid(row=0, column=0, sticky=W)
+        ttk.Label(
+            section,
+            text="勾選後試算表會多一欄門廊，請在試算表中填寫各戶面積。未勾選則不顯示這一欄。",
+            wraplength=500,
+        ).grid(row=1, column=0, sticky=W, pady=(4, 0))
+
+    def _sync_porch_option(self, path: Path) -> None:
+        """CSV 已有門廊欄時勾選；沒有則取消。讀取失敗時維持目前勾選。"""
+        try:
+            data = parse_import_csv(path)
+        except (OSError, ValueError):
+            return
+        self.include_porch.set(data.include_porch)
 
     def _build_parking_section(
         self, parent: ttk.Frame, row: int, padding: dict[str, int]
@@ -152,7 +183,9 @@ class TemplateBuilderApp:
         if not self.output_path.get():
             default_output = Path(path).with_name(DEFAULT_OUTPUT_NAME)
             self.output_path.set(str(default_output))
-        self.status.set(f"已選擇 CSV：{Path(path).name}")
+        self._sync_porch_option(Path(path))
+        porch = "（含門廊）" if self.include_porch.get() else ""
+        self.status.set(f"已選擇 CSV：{Path(path).name}{porch}")
 
     def _choose_output(self) -> None:
         initial = self.output_path.get() or DEFAULT_OUTPUT_NAME
@@ -176,6 +209,7 @@ class TemplateBuilderApp:
             row_vars["width"].set(str(width))
             row_vars["length"].set(str(length))
             row_vars["count"].set("")
+        self.include_porch.set(False)
         self.status.set("請選擇 CSV 檔案並輸入公設比。")
 
     def _collect_parking_spaces(self) -> list[ParkingSpace | None] | None:
@@ -237,7 +271,7 @@ class TemplateBuilderApp:
 
     def _validate(
         self,
-    ) -> tuple[Path, float | None, Path, list[ParkingSpace | None]] | None:
+    ) -> tuple[Path, float | None, Path, list[ParkingSpace | None], bool] | None:
         csv_text = self.csv_path.get().strip()
         if not csv_text:
             messagebox.showwarning("尚未選擇 CSV", "請先選擇一個 CSV 檔案。")
@@ -260,7 +294,9 @@ class TemplateBuilderApp:
 
         parking_spaces = self._collect_parking_spaces()
         if parking_spaces is None:
-            return
+            return None
+
+        include_porch = bool(self.include_porch.get())
 
         output_text = self.output_path.get().strip()
         if output_text:
@@ -269,19 +305,19 @@ class TemplateBuilderApp:
             output_file = csv_file.with_name(DEFAULT_OUTPUT_NAME)
             self.output_path.set(str(output_file))
 
-        return csv_file, ratio, output_file, parking_spaces
+        return csv_file, ratio, output_file, parking_spaces, include_porch
 
     def _on_build_clicked(self) -> None:
         validated = self._validate()
         if validated is None:
             return
-        csv_file, ratio, output_file, parking_spaces = validated
+        csv_file, ratio, output_file, parking_spaces, include_porch = validated
 
         self.build_button.configure(state=DISABLED)
         self.status.set("建立中…")
         thread = threading.Thread(
             target=self._build_worker,
-            args=(csv_file, ratio, output_file, parking_spaces),
+            args=(csv_file, ratio, output_file, parking_spaces, include_porch),
             daemon=True,
         )
         thread.start()
@@ -292,6 +328,7 @@ class TemplateBuilderApp:
         ratio: float | None,
         output_file: Path,
         parking_spaces: list[ParkingSpace | None],
+        include_porch: bool,
     ) -> None:
         try:
             import_data = parse_import_csv(csv_file.resolve())
@@ -301,6 +338,7 @@ class TemplateBuilderApp:
                 public_areas=import_data.public_areas,
                 public_ratio=ratio,
                 parking_spaces=parking_spaces,
+                include_porch=include_porch,
             )
         except PermissionError:
             self.root.after(0, self._on_permission_error, output_file)
@@ -308,21 +346,29 @@ class TemplateBuilderApp:
             traceback.print_exc()
             self.root.after(0, self._on_build_error, exc)
         else:
-            unit_count = len(import_data.units)
-            public_count = len(import_data.public_areas)
             self.root.after(
-                0, self._on_build_success, result, unit_count, public_count
+                0,
+                self._on_build_success,
+                result,
+                len(import_data.units),
+                len(import_data.public_areas),
+                include_porch,
             )
 
     def _on_build_success(
-        self, result: BuildResult, unit_count: int, public_count: int
+        self,
+        result: BuildResult,
+        unit_count: int,
+        public_count: int,
+        include_porch: bool = False,
     ) -> None:
         self.build_button.configure(state=NORMAL)
+        porch = "、含門廊" if include_porch else ""
+        summary = f"（{unit_count} 戶、{public_count} 筆公設{porch}）"
         incomplete = result.incomplete_adjustments
         if incomplete:
             self.status.set(
-                f"完成（部分持分未調整）：{result.path.name}"
-                f"（{unit_count} 戶、{public_count} 筆公設）"
+                f"完成（部分持分未調整）：{result.path.name}{summary}"
             )
             details = "\n".join(
                 f"・{item.name}：目標 {item.target}、實際 {item.actual}"
@@ -335,9 +381,7 @@ class TemplateBuilderApp:
                 f"{details}",
             )
         else:
-            self.status.set(
-                f"完成：{result.path.name}（{unit_count} 戶、{public_count} 筆公設）"
-            )
+            self.status.set(f"完成：{result.path.name}{summary}")
             messagebox.showinfo(
                 "建立完成",
                 "已產生試算表，所有持分均已調整到目標。",

@@ -230,6 +230,52 @@ def test_import_full_public_template(tmp_path: Path) -> None:
     wb.close()
 
 
+def test_parse_optional_porch_column(tmp_path: Path) -> None:
+    porch_csv = """\
+,主建物,陽台,門廊
+1F-A,10,2,1.5
+1F-B,20,3,
+公設,樓別,面積,樓別,面積
+,1F,100,屋突1,50
+"""
+    data = parse_import_csv(_write_csv(tmp_path, porch_csv))
+    assert data.include_porch is True
+    assert data.units[0].porch_area == 1.5
+    assert data.units[1].porch_area == 0.0
+    assert data.public_areas[1].floor_label == "屋突1"
+    assert data.public_areas[1].side == "right"
+
+    blank = parse_import_csv(
+        _write_csv(tmp_path, ",主建物,陽台,門廊(㎡)\n1F-A,10,0,0\n", "zeros.csv")
+    )
+    assert blank.include_porch is True
+    assert blank.units[0].porch_area == 0.0
+
+    plain = parse_import_csv(_write_csv(tmp_path, ",主建物,陽台\n1F-A,10,2\n", "plain.csv"))
+    assert plain.include_porch is False
+    assert plain.units[0].porch_area is None
+
+
+def test_porch_csv_builds_porch_sheet(tmp_path: Path) -> None:
+    data = parse_import_csv(
+        _write_csv(tmp_path, ",主建物,陽台,門廊\n1F-A,10,2,\n1F-B,8,1,3\n")
+    )
+    output = tmp_path / "from-csv.xlsx"
+    create_template(
+        output,
+        unit_data=data.units,
+        public_areas=data.public_areas,
+        include_porch=data.include_porch,
+    )
+    wb = openpyxl.load_workbook(output, data_only=False)
+    ws = wb.active
+    assert ws["E2"].value == "門廊"
+    assert ws["E5"].value == 0.0
+    assert ws["E6"].value == 3.0
+    assert ws["F5"].value == "=C5+D5+E5"
+    wb.close()
+
+
 def test_empty_csv_raises(tmp_path: Path) -> None:
     csv_path = tmp_path / "empty.csv"
     csv_path.write_text(",主建物,陽台\n", encoding="utf-8-sig")

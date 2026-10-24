@@ -6,8 +6,8 @@ import openpyxl
 import pytest
 
 from csv_import import PublicAreaData, UnitData
-from formula_utils import LayoutConfig, rewrite_formula
-from parking_balance import compute_share_adjustments
+from formula_utils import LayoutConfig, map_source_column, rewrite_formula
+from parking_balance import compute_share_adjustments, total_unit_area
 from share_tweak import ShareRow, solve_share_adjustments
 from template_builder import (
     LAND_SHARE_COL,
@@ -17,7 +17,7 @@ from template_builder import (
     ParkingSpace,
     create_template,
 )
-from template_schema import MERGED_CELL_COUNT
+from template_schema import MERGED_CELL_COUNT, PORCH_ALLOCATION_FOOTNOTE
 
 
 @pytest.fixture
@@ -118,6 +118,91 @@ def test_parking_numeric_inputs_cleared(ws) -> None:
 
 def test_main_title_preserved(ws) -> None:
     assert ws["B1"].value == "各戶面積及停車位分算明細"
+
+
+def test_appearance_matches_reference_sheet(ws) -> None:
+    assert ws.column_dimensions["A"].width == 13
+    assert ws.column_dimensions["B"].width == 17.63
+    assert ws.column_dimensions["D"].width == 14.63
+    assert ws.column_dimensions["F"].width == 15
+    assert ws.column_dimensions["G"].width == 15.38
+    assert ws.column_dimensions["W"].width == 13
+
+    title = ws["B1"]
+    assert title.font.name == "DFKai-SB"
+    assert title.font.size == 13
+    assert title.alignment.horizontal == "center"
+    assert title.alignment.vertical == "center"
+    assert title.border.left.style == "thin"
+
+    header = ws["A2"]
+    assert header.font.name == "DFKai-SB"
+    assert header.alignment.horizontal == "center"
+    assert header.alignment.vertical == "center"
+    assert header.alignment.wrap_text is True
+    assert header.border.bottom.style == "thin"
+
+    assert ws["A5"].alignment.horizontal == "center"
+    assert ws["B5"].alignment.horizontal == "center"
+    area = ws["E5"]
+    assert area.alignment.horizontal == "right"
+    assert area.alignment.vertical == "bottom"
+    assert area.number_format == "0.00"
+    assert area.border.right.style == "thin"
+    assert ws["P5"].number_format == "0.00"
+    assert ws["R5"].number_format == "General"
+    assert ws["R5"].alignment.horizontal == "right"
+    assert ws["I3"].number_format == "General"
+    assert ws["F3"].number_format == "0.00"
+    assert ws["F3"].alignment.horizontal == "center"
+
+    assert ws["B15"].alignment.horizontal == "center"
+    assert ws["A15"].alignment.horizontal == "right"
+    assert ws["G15"].number_format == "0.00"
+    assert ws["I15"].number_format == "General"
+
+    config = LayoutConfig(units=10)
+    footnote = ws.cell(config.map_row(80), 2)
+    allocation_note = ws.cell(config.map_row(81), 2).value
+    assert "主建物+附屬建物" in str(allocation_note)
+    assert "門廊" not in str(allocation_note)
+    assert footnote.font.name == "DFKai-SB"
+    assert footnote.alignment.horizontal == "left"
+    assert footnote.border.left.style is None
+    assert ws.row_dimensions[config.map_row(59)].height == 32
+    share_label = ws.cell(config.map_row(77), 7)
+    assert share_label.value == "車位持分/100000"
+    assert share_label.font.size == 10
+    assert share_label.font.name == "DFKai-SB"
+
+
+def test_per_floor_public_area_uses_area_format(tmp_path: Path) -> None:
+    output = tmp_path / "public.xlsx"
+    create_template(
+        output,
+        unit_data=[UnitData(label="1F-A1", main_area=10, balcony_area=1, unit_count=1)],
+        public_areas=[
+            PublicAreaData(
+                floor_label="6~26F*21",
+                area=343.2,
+                is_per_floor=True,
+                side="left",
+            )
+        ],
+    )
+    wb = openpyxl.load_workbook(output)
+    ws = wb.active
+    config = LayoutConfig(units=1)
+    label = ws.cell(config.public_data_row(0), 2)
+    per_floor = ws.cell(config.public_data_row(1), 2)
+    total = ws.cell(config.public_data_row(0), 3)
+    assert label.alignment.horizontal == "center"
+    assert per_floor.value == 343.2
+    assert per_floor.alignment.horizontal == "center"
+    assert per_floor.alignment.vertical == "center"
+    assert per_floor.number_format == "0.00"
+    assert total.number_format == "0.00"
+    wb.close()
 
 
 def test_parking_labels(ws) -> None:
@@ -361,6 +446,97 @@ def test_build_result_incomplete_filter() -> None:
     incomplete = result.incomplete_adjustments
     assert len(incomplete) == 1
     assert incomplete[0].name == "公設計算"
+
+
+def test_map_source_column_inserts_porch_columns() -> None:
+    assert map_source_column(4, True) == 4
+    assert map_source_column(5, True) == 6
+    assert map_source_column(12, True) == 13
+    assert map_source_column(13, True) == 15
+    assert map_source_column(23, True) == 25
+    assert map_source_column(5, False) == 5
+
+
+def test_total_unit_area_includes_porch_when_enabled() -> None:
+    units = [UnitData(label="a", main_area=10, balcony_area=1, porch_area=2, unit_count=3)]
+    assert total_unit_area(units) == 33
+    assert total_unit_area(units, include_porch=True) == 39
+
+
+def _merged(ws, min_col: int, min_row: int, max_col: int, max_row: int) -> bool:
+    return any(
+        (
+            merged.min_col,
+            merged.min_row,
+            merged.max_col,
+            merged.max_row,
+        )
+        == (min_col, min_row, max_col, max_row)
+        for merged in ws.merged_cells.ranges
+    )
+
+
+def test_porch_layout_shifts_columns_and_allocation_base(tmp_path: Path) -> None:
+    output = tmp_path / "porch.xlsx"
+    create_template(
+        output,
+        unit_data=[
+            UnitData(label="1F-A", main_area=10, balcony_area=2, porch_area=1.5, unit_count=1),
+            UnitData(label="1F-B", main_area=20, balcony_area=0, porch_area=0, unit_count=1),
+        ],
+        public_areas=[
+            PublicAreaData(floor_label="屋突1", area=50, is_per_floor=False, side="right")
+        ],
+        include_porch=True,
+    )
+    wb = openpyxl.load_workbook(output, data_only=False)
+    ws = wb.active
+
+    assert ws["E2"].value == "門廊"
+    assert ws["F2"].value == "主+附+門廊"
+    assert ws["N2"].value == "門廊"
+    assert ws["O2"].value == "主+附+門廊"
+    assert ws["E4"].value == "㎡"
+    assert ws["E5"].value == 1.5
+    assert ws["E6"].value == 0
+    assert ws["F5"].value == "=C5+D5+E5"
+    assert ws["N5"].value == "=A5*E5"
+    assert ws["O5"].value == "=A5*F5"
+    assert ws["H5"].value == "=F5+G5"
+    assert ws["S5"].value == "=round($S$4*F5/$F$7,2)"
+    assert ws["T5"].value == "=round(S5,0)"
+    assert ws["E7"].value == "=N7"
+    assert ws["F7"].value == "=O7"
+    assert ws["N7"].value == "=sum(N5:N6)"
+
+    config = LayoutConfig(units=2, include_porch=True)
+    public_row = config.public_data_row(0)
+    assert ws.cell(public_row, 4).value == "屋突1"
+    assert ws.cell(public_row, 5).value is None
+    assert ws.cell(public_row, 6).value == 50
+    assert _merged(ws, 4, public_row, 5, public_row)
+    summary = ws.cell(config.map_row(58), 4).value
+    assert summary == f"=sum(F{public_row}:F{public_row})"
+    footnote = ws.cell(config.map_row(81), 2).value
+    assert footnote == PORCH_ALLOCATION_FOOTNOTE
+    wb.close()
+
+
+def test_porch_template_moves_parking_columns(tmp_path: Path) -> None:
+    output = tmp_path / "porch-parking.xlsx"
+    create_template(output, units=10, include_porch=True)
+    wb = openpyxl.load_workbook(output, data_only=False)
+    ws = wb.active
+    assert ws["G3"].value == "=D19"
+    assert ws["S4"].value == "=J3-I39"
+    assert ws["J16"].value == "=I39"
+    assert ws["D19"].value == "=sum(C21:C30)+sum(F21:F29)"
+    assert ws["C36"].value == "=round(F15*C34/C35,2)"
+    assert ws.cell(38, 9).value == "=round($I$37*I35,0)"
+    assert _merged(ws, 5, 2, 5, 3)
+    assert _merged(ws, 14, 2, 14, 4)
+    assert _merged(ws, 4, 20, 5, 20)
+    wb.close()
 
 
 def test_create_without_source_file(tmp_path: Path) -> None:

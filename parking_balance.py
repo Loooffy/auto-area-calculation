@@ -7,7 +7,8 @@ from __future__ import annotations
 - 車位總持分概算（框3）：D74 = 100000 - D73，其中
   D73 = round(C75 / D58 * 100000, 0)，
   C75 = round(E54 * C73 / C74, 2)，C74 = 100 - C73（公設比），
-  E54 = 各戶（主+附）面積加權合計，D58 = 公設面積合計。
+  E54 = 各戶分攤基數加權合計（無門廊為主+附，有門廊為主+附+門廊），
+  D58 = 公設面積合計。
 - 各尺寸車位持分（框1）：第77列 = round($H$76 * 尺寸比例, 0)，其中
   H76（基準車位持分）= round(D74 / H75, 0)，
   H75（小車位數倍數）= Σ(車位數 × 尺寸比例)。
@@ -41,9 +42,17 @@ def excel_round(value: float, digits: int = 0) -> float:
     return float(Decimal(repr(value)).quantize(quantum, rounding=ROUND_HALF_UP))
 
 
-def total_unit_area(units: Sequence[UnitData]) -> float:
-    """各戶（主+附）面積加權合計，對應試算表 E54。"""
-    return sum(u.unit_count * (u.main_area + u.balcony_area) for u in units)
+def allocation_area(unit: UnitData, include_porch: bool) -> float:
+    """單戶分攤面積。有門廊時為主建物 + 陽台 + 門廊。"""
+    area = unit.main_area + unit.balcony_area
+    if include_porch and unit.porch_area is not None:
+        area += unit.porch_area
+    return area
+
+
+def total_unit_area(units: Sequence[UnitData], include_porch: bool = False) -> float:
+    """各戶分攤面積加權合計，對應試算表的主+附（或主+附+門廊）合計。"""
+    return sum(u.unit_count * allocation_area(u, include_porch) for u in units)
 
 
 def total_public_area(public_areas: Sequence[PublicAreaData]) -> float:
@@ -83,6 +92,7 @@ def compute_share_adjustments(
     used_spaces: Sequence["ParkingSpace"],
     max_delta: int = MAX_DELTA,
     tolerance: int = MAX_TOLERANCE,
+    include_porch: bool = False,
 ) -> ShareAdjustment | None:
     """計算讓框2盡量接近框3的每尺寸微調（每種最多 ±max_delta）。
 
@@ -93,7 +103,7 @@ def compute_share_adjustments(
     if not used_spaces or public_ratio is None or not units or not public_areas:
         return None
 
-    e54 = total_unit_area(units)
+    e54 = total_unit_area(units, include_porch=include_porch)
     d58 = total_public_area(public_areas)
     c74 = 100 - public_ratio
     if c74 == 0 or d58 == 0:

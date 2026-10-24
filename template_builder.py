@@ -4,25 +4,39 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill
-from openpyxl.utils import range_boundaries
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import (
+    column_index_from_string,
+    get_column_letter,
+    range_boundaries,
+)
 from openpyxl.worksheet.worksheet import Worksheet
 
 from csv_import import PublicAreaData, UnitData
-from formula_utils import LayoutConfig, data_row_formulas, rewrite_formula
-from parking_balance import MAX_TOLERANCE, ShareAdjustment, compute_share_adjustments
+from formula_utils import (
+    LayoutConfig,
+    data_row_formulas,
+    rewrite_formula,
+    shift_formula_columns,
+)
+from parking_balance import (
+    MAX_TOLERANCE,
+    ShareAdjustment,
+    allocation_area,
+    compute_share_adjustments,
+)
 from share_tweak import build_share_rows, solve_share_adjustments
 from template_schema import (
     COLUMN_WIDTHS,
     HEADER_FORMULAS,
     HEADER_STATIC,
-    MAX_COLUMN,
     MERGED_RANGES,
     PARKING_END_ROW,
     PARKING_FORMULAS,
     PARKING_NOTE_PLACEHOLDER,
     PARKING_START_ROW,
     PARKING_STATIC,
+    PORCH_ALLOCATION_FOOTNOTE,
     PUBLIC_AREA_END_ROW,
     PUBLIC_AREA_START_ROW,
     PUBLIC_AREA_SUMMARY_COL,
@@ -61,9 +75,328 @@ class BuildResult:
         return tuple(item for item in self.adjustments if not item.completed)
 
 
-def apply_column_widths(ws: Worksheet) -> None:
+def apply_column_widths(ws: Worksheet, config: LayoutConfig) -> None:
     for col_letter, width in COLUMN_WIDTHS.items():
-        ws.column_dimensions[col_letter].width = width
+        dest = get_column_letter(config.col(column_index_from_string(col_letter)))
+        ws.column_dimensions[dest].width = width
+    if config.include_porch:
+        ws.column_dimensions["E"].width = 13.0
+        ws.column_dimensions["N"].width = 13.0
+        # 「主+附+門廊」比原來的「主+附」長，合計欄加寬。
+        ws.column_dimensions["F"].width = 18.0
+        ws.column_dimensions["O"].width = 18.0
+
+
+BODY_FONT = Font(name="DFKai-SB", size=13)
+SHARE_LABEL_FONT = Font(name="DFKai-SB", size=10)
+THIN_SIDE = Side(style="thin", color="FF000000")
+THIN_BORDER = Border(
+    left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE
+)
+AREA_NUMBER_FORMAT = "0.00"
+MULTILINE_ROW_HEIGHT = 32
+# 各戶面積欄：主建物到坪（C–H），以及加權後的對應欄（K–P）。
+AREA_COLUMNS = frozenset({3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16})
+FOOTNOTE_SOURCE_ROWS = (80, 81)
+PARKING_COUNT_LAST_ROW = 66
+PARKING_PING_ROW = 68
+PARKING_RATIO_BLOCK_LAST_ROW = 75
+PARKING_CALC_LAST_ROW = 78
+PARKING_NOTE_LAST_COL = 8
+PARKING_GRID_FIRST_COL = 7
+PARKING_GRID_LAST_COL = 12
+PARKING_CALC_LAST_COL = 11
+PUBLIC_BLOCK_FIRST_COL = 2
+PUBLIC_BLOCK_LAST_COL = 5
+
+
+def _merged_row_span(ws: Worksheet, row: int, col: int) -> int:
+    for merged in ws.merged_cells.ranges:
+        if (
+            merged.min_row <= row <= merged.max_row
+            and merged.min_col <= col <= merged.max_col
+        ):
+            return merged.max_row - merged.min_row + 1
+    return 1
+
+
+def _is_numeric_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    return isinstance(value, str) and value.startswith("=")
+
+
+def _paint(
+    ws: Worksheet,
+    row: int,
+    col: int,
+    *,
+    horizontal: str,
+    vertical: str,
+    number_format: str | None = None,
+) -> None:
+    cell = ws.cell(row, col)
+    wrap = isinstance(cell.value, str) and "\n" in cell.value
+    cell.font = BODY_FONT
+    cell.alignment = Alignment(
+        horizontal=horizontal, vertical=vertical, wrap_text=wrap
+    )
+    cell.border = THIN_BORDER
+    if number_format is not None:
+        cell.number_format = number_format
+    if wrap and _merged_row_span(ws, row, col) == 1:
+        height = ws.row_dimensions[row].height
+        if height is None or height < MULTILINE_ROW_HEIGHT:
+            ws.row_dimensions[row].height = MULTILINE_ROW_HEIGHT
+
+
+def _paint_box(
+    ws: Worksheet,
+    min_row: int,
+    max_row: int,
+    min_col: int,
+    max_col: int,
+    *,
+    horizontal: str,
+    vertical: str,
+    number_format: str | None = None,
+) -> None:
+    for row in range(min_row, max_row + 1):
+        for col in range(min_col, max_col + 1):
+            _paint(
+                ws,
+                row,
+                col,
+                horizontal=horizontal,
+                vertical=vertical,
+                number_format=number_format,
+            )
+
+
+def _area_columns(config: LayoutConfig) -> frozenset[int]:
+    columns = {config.col(col) for col in AREA_COLUMNS}
+    if config.include_porch:
+        columns.update((5, 14))
+    return frozenset(columns)
+
+
+def _style_main_table(ws: Worksheet, config: LayoutConfig) -> None:
+    for col in range(2, config.col(8) + 1):
+        _paint(ws, 1, col, horizontal="center", vertical="center")
+
+    areas = _area_columns(config)
+    public_header = (3, config.col(6))
+    for row in range(2, 5):
+        for col in range(1, config.max_column + 1):
+            number_format = AREA_NUMBER_FORMAT if (row, col) == public_header else None
+            _paint(
+                ws,
+                row,
+                col,
+                horizontal="center",
+                vertical="center",
+                number_format=number_format,
+            )
+
+    for row in range(config.data_start, config.total_row + 1):
+        for col in range(1, config.max_column + 1):
+            if col <= 2 and not (row == config.total_row and col == 1):
+                _paint(ws, row, col, horizontal="center", vertical="center")
+                continue
+            number_format = AREA_NUMBER_FORMAT if col in areas else None
+            _paint(
+                ws,
+                row,
+                col,
+                horizontal="right",
+                vertical="bottom",
+                number_format=number_format,
+            )
+
+
+def _public_label_columns(config: LayoutConfig) -> frozenset[int]:
+    # 有門廊時右側樓別併入插入的空白欄（E），面積改在 F。
+    columns = {2, 4}
+    if config.include_porch:
+        columns.add(5)
+    return frozenset(columns)
+
+
+def _style_public_area_cell(
+    ws: Worksheet, row: int, col: int, config: LayoutConfig
+) -> None:
+    value = ws.cell(row, col).value
+    # 樓別欄（B、D；有門廊時含併入的 E）置中；面積欄靠右。
+    if col in _public_label_columns(config):
+        number_format = AREA_NUMBER_FORMAT if _is_numeric_value(value) else None
+        _paint(
+            ws,
+            row,
+            col,
+            horizontal="center",
+            vertical="center",
+            number_format=number_format,
+        )
+        return
+    _paint(
+        ws,
+        row,
+        col,
+        horizontal="right",
+        vertical="bottom",
+        number_format=AREA_NUMBER_FORMAT,
+    )
+
+
+def _style_lower_section(ws: Worksheet, config: LayoutConfig) -> None:
+    note_last_col = config.col(PARKING_NOTE_LAST_COL)
+    grid_first = config.col(PARKING_GRID_FIRST_COL)
+    grid_last = config.col(PARKING_GRID_LAST_COL)
+    calc_last = config.col(PARKING_CALC_LAST_COL)
+    public_last_col = config.col(PUBLIC_BLOCK_LAST_COL)
+    size_first = config.col(PARKING_SIZE_COLS[0])
+    size_last = config.col(PARKING_SIZE_COLS[-1])
+
+    note_row = config.map_row(PARKING_NOTE_ROW)
+    _paint_box(
+        ws,
+        note_row,
+        note_row,
+        PARKING_NOTE_COL,
+        note_last_col,
+        horizontal="center",
+        vertical="center",
+    )
+    for col in (config.col(9), config.col(19), config.col(22)):
+        _paint(ws, note_row, col, horizontal="right", vertical="bottom")
+    _paint(
+        ws,
+        config.map_row(PARKING_NOTE_ROW + 1),
+        config.col(9),
+        horizontal="right",
+        vertical="bottom",
+    )
+
+    summary_row = config.map_row(PUBLIC_AREA_SUMMARY_ROW)
+    header_row = config.map_row(PARKING_SIZE_HEADER_ROW)
+    for col in range(PUBLIC_BLOCK_FIRST_COL, public_last_col + 1):
+        if col >= PUBLIC_AREA_SUMMARY_COL:
+            _paint(
+                ws,
+                summary_row,
+                col,
+                horizontal="right",
+                vertical="bottom",
+                number_format=AREA_NUMBER_FORMAT,
+            )
+        else:
+            _paint(ws, summary_row, col, horizontal="center", vertical="center")
+    _paint_box(
+        ws,
+        header_row,
+        header_row,
+        PUBLIC_BLOCK_FIRST_COL,
+        public_last_col,
+        horizontal="center",
+        vertical="center",
+    )
+
+    public_first = config.public_data_row(0)
+    public_last_row = config.map_row(PUBLIC_AREA_END_ROW) + config.public_area_extra_rows
+    for row in range(public_first, public_last_row + 1):
+        for col in range(PUBLIC_BLOCK_FIRST_COL, public_last_col + 1):
+            _style_public_area_cell(ws, row, col, config)
+
+    _paint_box(
+        ws,
+        summary_row,
+        summary_row,
+        grid_first,
+        calc_last,
+        horizontal="center",
+        vertical="center",
+    )
+    _paint_box(
+        ws,
+        header_row,
+        header_row,
+        grid_first,
+        grid_last,
+        horizontal="center",
+        vertical="center",
+    )
+    for src_row in range(PUBLIC_AREA_START_ROW, PARKING_COUNT_LAST_ROW + 1):
+        row = config.map_row(src_row)
+        _paint(ws, row, grid_first, horizontal="center", vertical="center")
+        for col in range(grid_first + 1, grid_last + 1):
+            _paint(ws, row, col, horizontal="right", vertical="bottom")
+    for src_row in range(PARKING_COUNT_LAST_ROW + 1, PARKING_PING_ROW + 1):
+        row = config.map_row(src_row)
+        _paint(ws, row, grid_first, horizontal="center", vertical="center")
+        for col in range(size_first, size_last + 1):
+            _paint(
+                ws,
+                row,
+                col,
+                horizontal="right",
+                vertical="bottom",
+                number_format=AREA_NUMBER_FORMAT,
+            )
+
+    proportion_row = config.map_row(70)
+    _paint_box(
+        ws,
+        proportion_row,
+        proportion_row,
+        size_first,
+        size_last,
+        horizontal="center",
+        vertical="center",
+    )
+    for src_row in range(PARKING_SIZE_LABEL_ROW, PARKING_CALC_LAST_ROW + 1):
+        row = config.map_row(src_row)
+        _paint(ws, row, grid_first, horizontal="center", vertical="center")
+        if src_row == PARKING_SHARE_ROW:
+            ws.cell(row, grid_first).font = SHARE_LABEL_FONT
+        number_format = AREA_NUMBER_FORMAT if src_row == PARKING_ACTUAL_AREA_ROW else None
+        horizontal = "center" if src_row == PARKING_SIZE_LABEL_ROW else "right"
+        vertical = "center" if src_row == PARKING_SIZE_LABEL_ROW else "bottom"
+        for col in range(size_first, size_last + 1):
+            _paint(
+                ws,
+                row,
+                col,
+                horizontal=horizontal,
+                vertical=vertical,
+                number_format=number_format,
+            )
+
+    for src_row in range(PUBLIC_RATIO_ROW, PARKING_RATIO_BLOCK_LAST_ROW + 1):
+        row = config.map_row(src_row)
+        _paint(ws, row, 2, horizontal="center", vertical="center")
+        area_format = AREA_NUMBER_FORMAT if src_row == PARKING_RATIO_BLOCK_LAST_ROW else None
+        _paint(
+            ws,
+            row,
+            3,
+            horizontal="right",
+            vertical="bottom",
+            number_format=area_format,
+        )
+        _paint(ws, row, 4, horizontal="right", vertical="bottom")
+
+    for src_row in FOOTNOTE_SOURCE_ROWS:
+        cell = ws.cell(config.map_row(src_row), 2)
+        cell.font = BODY_FONT
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+
+def apply_appearance(ws: Worksheet, config: LayoutConfig) -> None:
+    """套用標楷體、細框線、對齊與面積欄小數格式。不改底色。"""
+    _style_main_table(ws, config)
+    _style_lower_section(ws, config)
 
 
 def shift_range_rows(
@@ -92,23 +425,58 @@ def apply_merged_cells(
         min_row, max_row = shift_range_rows(min_row, max_row, config)
         ws.merge_cells(
             start_row=min_row,
-            start_column=min_col,
+            start_column=config.col(min_col),
             end_row=max_row,
-            end_column=max_col,
+            end_column=config.col(max_col),
         )
+    if config.include_porch:
+        _apply_porch_merges(ws, config)
+
+
+def _apply_porch_merges(ws: Worksheet, config: LayoutConfig) -> None:
+    """門廊欄的表頭合併，以及公設右欄被插入欄切開後把空白欄併回樓別。"""
+    ws.merge_cells(start_row=2, start_column=5, end_row=3, end_column=5)
+    ws.merge_cells(start_row=2, start_column=14, end_row=4, end_column=14)
+    header_row = config.map_row(PARKING_SIZE_HEADER_ROW)
+    ws.merge_cells(
+        start_row=header_row, start_column=4, end_row=header_row, end_column=5
+    )
+    first = config.public_data_row(0)
+    last = config.map_row(PUBLIC_AREA_END_ROW) + config.public_area_extra_rows
+    for row in range(first, last + 1):
+        ws.merge_cells(start_row=row, start_column=4, end_row=row, end_column=5)
 
 
 def set_formula(ws: Worksheet, row: int, col: int, formula: str, config: LayoutConfig) -> None:
-    ws.cell(row, col).value = rewrite_formula(formula, config)
+    shifted = shift_formula_columns(formula, config.include_porch)
+    ws.cell(row, config.col(col)).value = rewrite_formula(shifted, config)
+
+
+# 來源座標上的「主+附」表頭，有門廊時改稱「主+附+門廊」。
+_PORCH_HEADER_TEXT = {
+    (2, 5): "主+附+門廊",
+    (2, 13): "主+附+門廊",
+}
+# 插入欄的最終座標（不再做欄位平移）。
+_PORCH_INSERTED_HEADERS = {
+    (2, 5): "門廊",
+    (2, 14): "門廊",
+    (4, 5): "㎡",
+}
 
 
 def build_header(ws: Worksheet, config: LayoutConfig) -> None:
     for (row, col), value in HEADER_STATIC.items():
-        ws.cell(row, col).value = value
+        if config.include_porch and (row, col) in _PORCH_HEADER_TEXT:
+            value = _PORCH_HEADER_TEXT[(row, col)]
+        ws.cell(row, config.col(col)).value = value
+    if config.include_porch:
+        for (row, col), text in _PORCH_INSERTED_HEADERS.items():
+            ws.cell(row, col).value = text
     for (row, col), formula in HEADER_FORMULAS.items():
         set_formula(ws, row, col, formula, config)
-    ws.cell(1, 9).value = None
-    ws.cell(1, 10).value = None
+    ws.cell(1, config.col(9)).value = None
+    ws.cell(1, config.col(10)).value = None
 
 
 def build_data_rows(
@@ -118,9 +486,12 @@ def build_data_rows(
 ) -> None:
     for offset in range(config.units):
         row = config.data_start + offset
-        for col in INPUT_COLUMNS:
+        input_columns = ("A", "B", "C", "D", "E") if config.include_porch else INPUT_COLUMNS
+        for col in input_columns:
             ws[f"{col}{row}"].value = None
-        for col, formula in data_row_formulas(row, config.total_row).items():
+        for col, formula in data_row_formulas(
+            row, config.total_row, config.include_porch
+        ).items():
             ws[f"{col}{row}"].value = formula
 
         if unit_data is not None and offset < len(unit_data):
@@ -129,6 +500,8 @@ def build_data_rows(
             ws[f"B{row}"] = unit.label
             ws[f"C{row}"] = unit.main_area
             ws[f"D{row}"] = unit.balcony_area
+            if config.include_porch and unit.porch_area is not None:
+                ws[f"E{row}"] = unit.porch_area
 
 
 def build_total_row(ws: Worksheet, config: LayoutConfig) -> None:
@@ -137,6 +510,10 @@ def build_total_row(ws: Worksheet, config: LayoutConfig) -> None:
         ws.cell(row, col).value = text
     for col, formula in TOTAL_FORMULAS.items():
         set_formula(ws, row, col, formula, config)
+    if config.include_porch:
+        # 門廊合計對到加權門廊合計；加權門廊是各列戶數 × 門廊的加總。
+        ws.cell(row, 5).value = rewrite_formula(f"=N{TOTAL_ROW}", config)
+        ws.cell(row, 14).value = rewrite_formula("=sum(N5:N53)", config)
 
 
 def build_parking_section(ws: Worksheet, config: LayoutConfig) -> None:
@@ -150,7 +527,9 @@ def build_parking_section(ws: Worksheet, config: LayoutConfig) -> None:
 
         for (static_row, col), text in PARKING_STATIC.items():
             if static_row == src_row:
-                ws.cell(dst_row, col).value = text
+                if config.include_porch and (static_row, col) == (81, 2):
+                    text = PORCH_ALLOCATION_FOOTNOTE
+                ws.cell(dst_row, config.col(col)).value = text
 
         for (formula_row, col), formula in PARKING_FORMULAS.items():
             if formula_row == src_row:
@@ -193,7 +572,7 @@ def clear_public_area_data(
 ) -> None:
     for offset in range(public_area_rows_needed(public_areas)):
         dst_row = config.public_data_row(offset)
-        for col in (2, 3, 4, 5):
+        for col in range(2, config.col(5) + 1):
             ws.cell(dst_row, col).value = None
 
 
@@ -231,7 +610,8 @@ def update_public_area_total_formula(
     if left_last >= area_start:
         parts.append(f"sum(C{area_start}:C{left_last})")
     if right_last >= area_start:
-        parts.append(f"sum(E{area_start}:E{right_last})")
+        right_col = get_column_letter(config.col(5))
+        parts.append(f"sum({right_col}{area_start}:{right_col}{right_last})")
     if parts:
         ws.cell(summary_row, PUBLIC_AREA_SUMMARY_COL).value = "=" + "+".join(parts)
 
@@ -263,7 +643,7 @@ def fill_public_areas(
     for item in right_items:
         dst_row = config.public_data_row(offset)
         ws.cell(dst_row, 4).value = item.floor_label
-        ws.cell(dst_row, 5).value = item.area
+        ws.cell(dst_row, config.col(5)).value = item.area
         offset += 1
 
 
@@ -353,7 +733,8 @@ def apply_parking_spaces(
     ratio_row = config.map_row(PARKING_RATIO_ROW)
     clear_rows = [config.map_row(row) for row in PARKING_COLUMN_ROWS]
 
-    for idx, col in enumerate(PARKING_SIZE_COLS):
+    size_cols = tuple(config.col(col) for col in PARKING_SIZE_COLS)
+    for idx, col in enumerate(size_cols):
         if idx < len(used):
             space = used[idx]
             ws.cell(header_row, col).value = space.label
@@ -379,7 +760,7 @@ def apply_parking_span_merges(
     """
     if used_count < 2:
         return
-    start_col = PARKING_SIZE_COLS[0]
+    start_col = config.col(PARKING_SIZE_COLS[0])
     end_col = start_col + used_count - 1
     for src_row in PARKING_SPAN_MERGE_ROWS:
         row = config.map_row(src_row)
@@ -405,7 +786,11 @@ def apply_share_adjustments(
     回傳計算結果（含微調後車位總持分），資料不足時回傳 None。
     """
     adjustment = compute_share_adjustments(
-        unit_data, public_areas, public_ratio, used
+        unit_data,
+        public_areas,
+        public_ratio,
+        used,
+        include_porch=config.include_porch,
     )
     if adjustment is None:
         return None
@@ -416,7 +801,7 @@ def apply_share_adjustments(
     for idx, delta in enumerate(adjustment.deltas):
         if delta == 0:
             continue
-        col = PARKING_SIZE_COLS[0] + idx
+        col = config.col(PARKING_SIZE_COLS[0]) + idx
         cell = ws.cell(share_row, col)
         formula = cell.value
         if isinstance(formula, str) and formula.startswith("="):
@@ -456,7 +841,7 @@ def apply_unit_share_adjustments(
     回傳兩項（公設、土地）的完成狀態。
     """
     weights = [unit.unit_count for unit in unit_data]
-    areas = [unit.main_area + unit.balcony_area for unit in unit_data]
+    areas = [allocation_area(unit, config.include_porch) for unit in unit_data]
     total_area = sum(w * a for w, a in zip(weights, areas))
     if total_area == 0:
         return []
@@ -464,11 +849,11 @@ def apply_unit_share_adjustments(
     public_target = BUILDING_TOTAL_SHARE - parking_total
     public_rows = build_share_rows(weights, areas, public_target, total_area)
     public_result = solve_share_adjustments(public_rows, public_target)
-    _apply_row_share_shifts(ws, config, public_result.shifts, PUBLIC_SHARE_COL)
+    _apply_row_share_shifts(ws, config, public_result.shifts, config.col(PUBLIC_SHARE_COL))
 
     land_rows = build_share_rows(weights, areas, LAND_TARGET_TOTAL, total_area)
     land_result = solve_share_adjustments(land_rows, LAND_TARGET_TOTAL)
-    _apply_row_share_shifts(ws, config, land_result.shifts, LAND_SHARE_COL)
+    _apply_row_share_shifts(ws, config, land_result.shifts, config.col(LAND_SHARE_COL))
 
     return [
         AdjustmentStatus(
@@ -494,16 +879,21 @@ def create_template(
     sheet_name: str | None = None,
     public_ratio: float | None = None,
     parking_spaces: list[ParkingSpace | None] | None = None,
+    include_porch: bool = False,
 ) -> BuildResult:
     if unit_data is not None:
         units = len(unit_data)
     extra_rows = compute_public_area_extra_rows(public_areas) if public_areas else 0
-    config = LayoutConfig(units=units, public_area_extra_rows=extra_rows)
+    config = LayoutConfig(
+        units=units,
+        public_area_extra_rows=extra_rows,
+        include_porch=include_porch,
+    )
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name or SHEET_TITLE
 
-    apply_column_widths(ws)
+    apply_column_widths(ws, config)
     build_header(ws, config)
     build_data_rows(ws, config, unit_data)
     build_total_row(ws, config)
@@ -559,6 +949,7 @@ def create_template(
                     )
                 )
 
+    apply_appearance(ws, config)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return BuildResult(path=output_path, adjustments=tuple(adjustments))

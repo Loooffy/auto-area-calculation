@@ -18,6 +18,7 @@ class UnitData:
     main_area: float
     balcony_area: float
     unit_count: int = 1
+    porch_area: float | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class PublicAreaData:
 class ImportData:
     units: list[UnitData]
     public_areas: list[PublicAreaData]
+    include_porch: bool = False
 
 
 def parse_unit_count(label: str) -> int:
@@ -78,8 +80,11 @@ def _normalize_area_header(header: str) -> str:
     return header.replace("(㎡)", "").replace("㎡", "").strip()
 
 
-def _is_unit_header(col0: str, col1: str, col2: str) -> bool:
-    return col1 == "主建物" and col2 == "陽台"
+def _is_unit_header(col1: str, col2: str, col3: str) -> bool:
+    if _normalize_area_header(col1) != "主建物" or _normalize_area_header(col2) != "陽台":
+        return False
+    extra = _normalize_area_header(col3)
+    return extra in ("", "門廊")
 
 
 def _is_public_header(cells: list[str]) -> bool:
@@ -128,13 +133,15 @@ def _read_csv_rows(path: Path) -> list[list[str]]:
 def parse_import_csv(path: Path) -> ImportData:
     """讀取試算表 CSV（各戶面積 + 公設面積）。
 
-    各戶區段：層數及編號, 主建物(㎡), 陽台(㎡)
+    各戶區段：層數及編號, 主建物(㎡), 陽台(㎡) [, 門廊(㎡)]
+    表頭含「門廊」時這個案子才有門廊欄；空白視為 0。
     公設區段：, 樓別, 面積(㎡) [, 樓別, 面積(㎡)]
     左欄為地上樓層，右欄為屋突／地下室；多層如 4~9F*6 的數值為單層面積。
     """
     units: list[UnitData] = []
     public_areas: list[PublicAreaData] = []
     section: str | None = None
+    include_porch = False
     public_has_right_column = False
 
     for row in _read_csv_rows(path):
@@ -147,8 +154,9 @@ def parse_import_csv(path: Path) -> ImportData:
 
         col0, col1, col2, col3, col4 = cells[:5]
 
-        if _is_unit_header(col0, col1, col2):
+        if _is_unit_header(col1, col2, col3):
             section = "units"
+            include_porch = _normalize_area_header(col3) == "門廊"
             continue
         if _is_public_header(cells):
             section = "public"
@@ -165,16 +173,19 @@ def parse_import_csv(path: Path) -> ImportData:
             try:
                 main_area = float(col1)
                 balcony_area = float(col2)
+                porch_area: float | None = None
+                if include_porch:
+                    porch_area = float(col3) if col3 else 0.0
             except ValueError as exc:
-                raise ValueError(
-                    f"無法解析各戶數值：{col0!r}, {col1!r}, {col2!r}"
-                ) from exc
+                values = (col0, col1, col2, col3) if include_porch else (col0, col1, col2)
+                raise ValueError(f"無法解析各戶數值：{values!r}") from exc
             units.append(
                 UnitData(
                     label=col0,
                     main_area=main_area,
                     balcony_area=balcony_area,
                     unit_count=parse_unit_count(col0),
+                    porch_area=porch_area,
                 )
             )
         elif section == "public":
@@ -189,7 +200,9 @@ def parse_import_csv(path: Path) -> ImportData:
     if not units:
         raise ValueError(f"CSV 無有效各戶資料：{path}")
 
-    return ImportData(units=units, public_areas=public_areas)
+    return ImportData(
+        units=units, public_areas=public_areas, include_porch=include_porch
+    )
 
 
 def parse_units_csv(path: Path) -> list[UnitData]:
