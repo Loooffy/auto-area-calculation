@@ -71,6 +71,9 @@ def main() -> None:
             public_areas=public_areas,
             public_ratio=args.public_ratio,
             include_porch=import_data.include_porch if args.csv is not None else False,
+            include_terrace=(
+                import_data.include_terrace if args.csv is not None else False
+            ),
         )
     except PermissionError:
         raise SystemExit(
@@ -82,8 +85,10 @@ def main() -> None:
     if unit_data is not None:
         public_count = len(public_areas) if public_areas else 0
         porch = "，含門廊" if import_data.include_porch else ""
+        terrace = "，含露台" if import_data.include_terrace else ""
         print(
-            f"OK: {output} ({len(unit_data)} units, {public_count} public areas{porch})"
+            f"OK: {output} ({len(unit_data)} units, {public_count} public areas"
+            f"{porch}{terrace})"
         )
     else:
         print(f"OK: {output}")

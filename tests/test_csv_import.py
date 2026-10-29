@@ -8,9 +8,11 @@ import pytest
 from csv_import import (
     PublicAreaData,
     UnitData,
+    basement_floor_labels,
     parse_import_csv,
     parse_unit_count,
     parse_units_csv,
+    validate_import_labels,
 )
 from template_builder import (
     compute_public_area_extra_rows,
@@ -18,7 +20,9 @@ from template_builder import (
     public_area_rows_needed,
 )
 
-SAMPLE_CSV = Path(__file__).resolve().parent.parent / "試算面積.csv"
+SAMPLE_CSV = (
+    Path(__file__).resolve().parent.parent / "template" / "輸入面積.csv"
+)
 
 FULL_PUBLIC_CSV = """\
 ,主建物,陽台
@@ -173,11 +177,11 @@ def test_import_into_template(tmp_path: Path) -> None:
     assert ws["B65"].value == "10~14F*5"
     assert ws["B66"].value == 104.87
     assert ws["C65"].value == "=B66*5"
-    assert ws["B67"].value == "15F"
-    assert ws["C67"].value == 104.87
-    assert ws["B68"].value == "16~20F*5"
-    assert ws["B69"].value == 104.87
-    assert ws["C68"].value == "=B69*5"
+    assert ws["B67"].value == "15~19F*5"
+    assert ws["B68"].value == 104.87
+    assert ws["C67"].value == "=B68*5"
+    assert ws["B69"].value == "20F"
+    assert ws["C69"].value == 104.87
     assert ws["B70"].value == "21~26F*6"
     assert ws["B71"].value == 104.87
     assert ws["C70"].value == "=B71*6"
@@ -248,7 +252,7 @@ def test_parse_optional_porch_column(tmp_path: Path) -> None:
     blank = parse_import_csv(
         _write_csv(tmp_path, ",主建物,陽台,門廊(㎡)\n1F-A,10,0,0\n", "zeros.csv")
     )
-    assert blank.include_porch is True
+    assert blank.include_porch is False
     assert blank.units[0].porch_area == 0.0
 
     plain = parse_import_csv(_write_csv(tmp_path, ",主建物,陽台\n1F-A,10,2\n", "plain.csv"))
@@ -276,11 +280,311 @@ def test_porch_csv_builds_porch_sheet(tmp_path: Path) -> None:
     wb.close()
 
 
+def test_parse_optional_terrace_column(tmp_path: Path) -> None:
+    terrace_csv = """\
+,主建物,陽台,露台
+1F-A,10,2,4.5
+1F-B,20,3,
+1F-C,8,1,0
+公設,樓別,面積
+,1F,100
+"""
+    data = parse_import_csv(_write_csv(tmp_path, terrace_csv))
+    assert data.include_terrace is True
+    assert data.include_porch is False
+    assert data.units[0].terrace_area == 4.5
+    assert data.units[1].terrace_area == 0.0
+    assert data.units[2].terrace_area == 0.0
+
+    zeros = parse_import_csv(
+        _write_csv(
+            tmp_path,
+            ",主建物,陽台,備註：露台\n1F-A,10,0,0\n1F-B,8,1,\n",
+            "terrace-zeros.csv",
+        )
+    )
+    assert zeros.include_terrace is False
+    assert zeros.units[0].terrace_area == 0.0
+    assert zeros.units[1].terrace_area == 0.0
+
+    both = parse_import_csv(
+        _write_csv(
+            tmp_path,
+            ",主建物,陽台,門廊,露台\n1F-A,10,2,1.5,3\n1F-B,8,1,0,0\n",
+            "porch-terrace.csv",
+        )
+    )
+    assert both.include_porch is True
+    assert both.include_terrace is True
+    assert both.units[0].porch_area == 1.5
+    assert both.units[0].terrace_area == 3.0
+    assert both.units[1].terrace_area == 0.0
+
+
+def test_terrace_csv_builds_remark_column(tmp_path: Path) -> None:
+    data = parse_import_csv(
+        _write_csv(
+            tmp_path,
+            ",主建物,陽台,露台\n1F-A,10,2,4.5\n1F-B,8,1,0\n1F-C,12,1,\n",
+        )
+    )
+    output = tmp_path / "terrace.xlsx"
+    create_template(
+        output,
+        unit_data=data.units,
+        public_areas=data.public_areas,
+        include_terrace=data.include_terrace,
+    )
+    wb = openpyxl.load_workbook(output, data_only=False)
+    ws = wb.active
+    # 無門廊：露台緊貼公設%左側 = W；公設% → X
+    assert ws["W2"].value == "備註：露台"
+    assert ws["W4"].value == "㎡"
+    assert ws["X2"].value == "公設%"
+    assert ws["W5"].value == 4.5
+    assert ws["W6"].value == 0.0
+    assert ws["W7"].value == 0.0
+    assert ws["I2"].value == "公設持分"
+    assert ws["I5"].value == "=R5"
+    assert "W5" not in str(ws["G5"].value)  # 面積合計不引用露台
+    wb.close()
+
+
+def test_all_zero_terrace_omits_column(tmp_path: Path) -> None:
+    data = parse_import_csv(
+        _write_csv(tmp_path, ",主建物,陽台,露台\n1F-A,10,2,0\n1F-B,8,1,\n")
+    )
+    assert data.include_terrace is False
+    output = tmp_path / "no-terrace.xlsx"
+    create_template(
+        output,
+        unit_data=data.units,
+        include_terrace=data.include_terrace,
+    )
+    wb = openpyxl.load_workbook(output, data_only=False)
+    ws = wb.active
+    assert ws["I2"].value == "公設持分"
+    assert ws["H2"].value is None or "露台" not in str(ws["H2"].value)
+    wb.close()
+
+
 def test_empty_csv_raises(tmp_path: Path) -> None:
     csv_path = tmp_path / "empty.csv"
     csv_path.write_text(",主建物,陽台\n", encoding="utf-8-sig")
     with pytest.raises(ValueError, match="無有效各戶資料"):
         parse_units_csv(csv_path)
+
+
+def test_unit_header_typo_names_the_column(tmp_path: Path) -> None:
+    csv_text = """\
+,主建屋,陽臺
+1F-A,10,0
+"""
+    with pytest.raises(ValueError, match="欄標題不符") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "bad-header.csv"))
+    message = str(exc_info.value)
+    assert message.count("欄標題不符") == 1
+    assert "第 1 列" in message
+    assert "第 2 欄「主建屋」應為「主建物」" in message
+    assert "第 3 欄「陽臺」應為「陽台」" in message
+
+
+def test_optional_header_typo_names_the_column(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台,門廊,花台
+1F-A,10,0,1,2
+"""
+    with pytest.raises(ValueError, match="欄標題不符") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "bad-terrace.csv"))
+    message = str(exc_info.value)
+    assert message.count("欄標題不符") == 1
+    assert "第 5 欄「花台」應為「露台」或「備註：露台」" in message
+    assert "第 2 欄" not in message.split("欄標題應為", 1)[0]
+
+
+def test_public_header_typo_names_the_column(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+1F-A,10,0
+公設,樓層,坪數,樓層,面積
+,1F,100,B1,50
+"""
+    with pytest.raises(ValueError, match="公設表頭不符") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "bad-public-header.csv"))
+    message = str(exc_info.value)
+    assert "第 2 欄「樓層」應為「樓別」" in message
+    assert "第 3 欄「坪數」應為「面積」" in message
+    assert "第 4 欄「樓層」應為「樓別」" in message
+
+
+def test_header_errors_are_collected(tmp_path: Path) -> None:
+    csv_text = """\
+,主建屋,陽台
+1F-A,10,0
+公共設施,樓層,坪數
+,1F,100
+"""
+    with pytest.raises(ValueError) as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "both-headers.csv"))
+    message = str(exc_info.value)
+    assert "第 2 欄「主建屋」應為「主建物」" in message
+    assert "第 1 欄「公共設施」應為「公設」" in message
+    assert "第 2 欄「樓層」應為「樓別」" in message
+
+
+def test_missing_header_explains_expected_columns(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="欄標題不符") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, "不是各戶資料\n", "bad.csv"))
+    message = str(exc_info.value)
+    assert "不是各戶資料" in message
+    assert "第 2 欄應為「主建物」，目前是「空白」" in message
+    assert "第 3 欄應為「陽台」，目前是「空白」" in message
+
+
+def test_unit_label_format_errors_are_collected(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+3F~6F-A,10,0
+2F-AB,8,0
+2-A,7,0
+6~4F-A1,9,0
+"""
+    with pytest.raises(ValueError, match="輸入面積格式錯誤") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "bad-units.csv"))
+    message = str(exc_info.value)
+    assert "3F~6F-A" in message
+    assert "2F-AB" in message
+    assert "2-A" in message
+    assert "6~4F-A1" in message
+
+
+def test_public_multiplier_must_match_floor_span(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+3~6F-A,10,0
+公設,樓別,面積
+,3~6F*3,100
+"""
+    with pytest.raises(ValueError, match=r"層數應為 4") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "bad-public.csv"))
+    assert "3~6F*4" in str(exc_info.value)
+
+
+def test_public_label_format_and_cross_check(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+2F-A,10,0
+3~6F-A,10,0
+公設,樓別,面積
+,2F-A,100
+,3F~6F*4,100
+"""
+    with pytest.raises(ValueError, match="輸入面積格式錯誤") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "cross.csv"))
+    message = str(exc_info.value)
+    assert "2F-A" in message
+    assert "3F~6F*4" in message
+    assert "2F" in message
+    assert "3~6F*4" in message
+
+
+def test_valid_labels_and_matching_public_pass(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+1F-S1,10,0
+2F-A,10,0
+3~6F-A,10,0
+公設,樓別,面積
+,1F,100
+,2F,100
+,3~6F*4,100
+,屋突一層,50
+,B1,200
+"""
+    data = parse_import_csv(_write_csv(tmp_path, csv_text, "ok.csv"))
+    assert data.units[0].unit_count == 1
+    assert data.units[2].unit_count == 4
+    assert data.public_areas[2].floor_multiplier == 4
+
+
+def test_custom_basement_names_are_right_column_in_order(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+1F-A,10,0
+公設,樓別,面積
+,1F,100
+,屋突一層,50
+,地下一,30
+,b1,20
+,B1,10
+"""
+    data = parse_import_csv(_write_csv(tmp_path, csv_text, "custom-basement.csv"))
+    by_label = {item.floor_label: item for item in data.public_areas}
+    assert by_label["1F"].side == "left"
+    assert by_label["屋突一層"].side == "right"
+    assert by_label["地下一"].side == "right"
+    assert by_label["b1"].side == "right"
+    assert by_label["B1"].side == "right"
+    assert basement_floor_labels(data.public_areas) == ["地下一", "b1", "B1"]
+
+
+def test_custom_basement_on_explicit_right_column(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+1F-A,10,0
+公設,樓別,面積,樓別,面積
+,1F,100,地下一,50
+,2F,80,b1,40
+"""
+    data = parse_import_csv(_write_csv(tmp_path, csv_text, "two-col.csv"))
+    assert basement_floor_labels(data.public_areas) == ["地下一", "b1"]
+    by_label = {item.floor_label: item for item in data.public_areas}
+    assert by_label["地下一"].side == "right"
+    assert by_label["b1"].side == "right"
+
+
+def test_malformed_floor_is_not_a_basement_name(tmp_path: Path) -> None:
+    csv_text = """\
+,主建物,陽台
+3~6F-A,10,0
+公設,樓別,面積
+,9~4F*6,100
+,地下一,30
+"""
+    with pytest.raises(ValueError, match="樓層範圍無效") as exc_info:
+        parse_import_csv(_write_csv(tmp_path, csv_text, "bad-range.csv"))
+    assert "地下一" not in str(exc_info.value)
+
+
+def test_units_only_csv_skips_public_cross_check(tmp_path: Path) -> None:
+    data = parse_import_csv(
+        _write_csv(tmp_path, ",主建物,陽台\n1F-A,10,0\n3~6F-B1,8,0\n", "units-only.csv")
+    )
+    assert len(data.units) == 2
+    assert data.public_areas == []
+
+
+def test_validate_import_labels_direct() -> None:
+    units = [
+        UnitData(label="3F~6F-A", main_area=1, balcony_area=0, unit_count=1),
+        UnitData(label="2F-A", main_area=1, balcony_area=0, unit_count=1),
+    ]
+    public = [
+        PublicAreaData(floor_label="3~6F*3", area=1, is_per_floor=True),
+    ]
+    with pytest.raises(ValueError, match="輸入面積格式錯誤") as exc_info:
+        validate_import_labels(units, public)
+    message = str(exc_info.value)
+    assert "3F~6F-A" in message
+    assert "層數應為 4" in message
+    assert "2F" in message
+
+
+def test_guangfu_csv_passes() -> None:
+    path = Path(__file__).resolve().parent.parent / "115-光復南路案-輸入面積.csv"
+    data = parse_import_csv(path)
+    assert any(u.label.startswith("3~6F-") and u.unit_count == 4 for u in data.units)
+    assert any(p.floor_label == "3~6F*4" for p in data.public_areas)
 
 
 EXTENDED_PUBLIC_CSV = """\

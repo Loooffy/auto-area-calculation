@@ -12,6 +12,8 @@ from __future__ import annotations
 - 各尺寸車位持分（框1）：第77列 = round($H$76 * 尺寸比例, 0)，其中
   H76（基準車位持分）= round(D74 / H75, 0)，
   H75（小車位數倍數）= Σ(車位數 × 尺寸比例)。
+  尺寸比例沿用各欄的 share_ratio；未指定時，第一欄為 1，其餘為
+  round(該欄實際面積 / 第一欄實際面積, 2)。
 - 車位總持分（框2）：H78 = Σ(車位數 × 各尺寸持分)。
 
 openpyxl 不會計算公式，因此這裡以 Python 重現整條計算鏈，求出讓框2
@@ -21,7 +23,6 @@ openpyxl 不會計算公式，因此這裡以 Python 重現整條計算鏈，求
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from itertools import product
 from typing import TYPE_CHECKING, Sequence
 
 from csv_import import PublicAreaData, UnitData
@@ -113,16 +114,9 @@ def compute_share_adjustments(
     d73 = excel_round(c75 / d58 * 100000, 0)
     target = int(round(100000 - d73))
 
-    area0 = used_spaces[0].actual_area
-    if area0 == 0:
+    ratios = _column_ratios(used_spaces)
+    if ratios is None:
         return None
-
-    ratios: list[float] = []
-    for idx, space in enumerate(used_spaces):
-        if idx == 0:
-            ratios.append(1.0)
-        else:
-            ratios.append(excel_round(space.actual_area / area0, 2))
 
     counts = [space.count for space in used_spaces]
     h75 = sum(count * ratio for count, ratio in zip(counts, ratios))
@@ -134,27 +128,81 @@ def compute_share_adjustments(
     base_total = sum(count * share for count, share in zip(counts, base_shares))
 
     # 只接受微調後框2與框3差距在 tolerance 以內的組合；都湊不到就不調整（deltas 全 0）。
-    # 排序：先選與目標差距最小，再選調整種類最少，最後選總調整幅度最小者。
-    zero_deltas = tuple(0 for _ in used_spaces)
-    best_key: tuple[int, int, int] | None = None
-    best_deltas: tuple[int, ...] = zero_deltas
-    best_total = base_total
-    delta_range = range(-max_delta, max_delta + 1)
-    for deltas in product(delta_range, repeat=len(used_spaces)):
-        total = base_total + sum(count * d for count, d in zip(counts, deltas))
-        diff = abs(target - total)
-        if diff > tolerance:
-            continue
-        key = (diff, sum(1 for d in deltas if d), sum(abs(d) for d in deltas))
-        if best_key is None or key < best_key:
-            best_key = key
-            best_deltas = deltas
-            best_total = total
+    # 排序：先選與目標差距最小，再選調整種類最少，最後選總調整幅度最小，再取字典序最小者。
+    chosen = _select_deltas(counts, target - base_total, max_delta, tolerance)
+    if chosen is None:
+        deltas = tuple(0 for _ in used_spaces)
+        adjusted_total = base_total
+    else:
+        deltas = chosen
+        adjusted_total = base_total + sum(
+            count * delta for count, delta in zip(counts, deltas)
+        )
 
     return ShareAdjustment(
         target_total=target,
         base_total=base_total,
-        adjusted_total=best_total,
+        adjusted_total=adjusted_total,
         base_shares=tuple(base_shares),
-        deltas=best_deltas,
+        deltas=deltas,
     )
+
+
+def _column_ratios(used_spaces: Sequence["ParkingSpace"]) -> list[float] | None:
+    """各欄車位尺寸比例。已指定 share_ratio 時直接使用。"""
+    if used_spaces[0].share_ratio is not None:
+        ratios: list[float] = []
+        for space in used_spaces:
+            if space.share_ratio is None:
+                return None
+            ratios.append(float(space.share_ratio))
+        return ratios
+
+    area0 = used_spaces[0].actual_area
+    if area0 == 0:
+        return None
+    ratios = [1.0]
+    for space in used_spaces[1:]:
+        ratios.append(excel_round(space.actual_area / area0, 2))
+    return ratios
+
+
+def _select_deltas(
+    counts: Sequence[int],
+    needed: int,
+    max_delta: int,
+    tolerance: int,
+) -> tuple[int, ...] | None:
+    """找出讓調整量最接近 needed、且差距在 tolerance 以內的每欄微調。
+
+    欄位數變多時不再全排列。同一調整量只保留種類最少、幅度最小、
+    字典序最小的組合，結果與全排列的優先順序相同。
+    """
+    span = range(-max_delta, max_delta + 1)
+    states: dict[int, tuple[int, int, tuple[int, ...]]] = {0: (0, 0, ())}
+    for count in counts:
+        nxt: dict[int, tuple[int, int, tuple[int, ...]]] = {}
+        for offset, (nonzero, magnitude, deltas) in states.items():
+            for delta in span:
+                new_offset = offset + count * delta
+                candidate = (
+                    nonzero + (delta != 0),
+                    magnitude + abs(delta),
+                    deltas + (delta,),
+                )
+                current = nxt.get(new_offset)
+                if current is None or candidate < current:
+                    nxt[new_offset] = candidate
+        states = nxt
+
+    best_key: tuple[int, int, int, tuple[int, ...]] | None = None
+    best_deltas: tuple[int, ...] | None = None
+    for offset, (nonzero, magnitude, deltas) in states.items():
+        diff = abs(needed - offset)
+        if diff > tolerance:
+            continue
+        key = (diff, nonzero, magnitude, deltas)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_deltas = deltas
+    return best_deltas
